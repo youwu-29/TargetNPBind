@@ -3,7 +3,7 @@
 This repository contains the official implementation of **TargetNPBind**, a computational framework for predicting natural product-target binding affinities.
 
 ## Model Architecture
-![TargetNPBind Framework](images/model_architecture.png)
+![TargetNPBind Framework](model.png)
 
 **TargetNPBind** features a dual-stream fusion framework that integrates 2D topological and 3D spatial information for accurate binding affinity prediction.
 
