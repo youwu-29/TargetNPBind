@@ -24,7 +24,7 @@ pip install dgl-cu118 scipy scikit-learn pandas numpy tqdm
 ```bash
 python test.py
 ```
-*The test script will load the pre-trained model from `results/train/model_weights.pth` and evaluate on the protein cold-start test set.*
+*The test script will load the pre-trained model from `results/model_weights.pth` and evaluate on the protein cold-start test set.*
 
 ## Complete Workflow (From Raw Data)
 
