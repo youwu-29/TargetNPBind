@@ -165,29 +165,43 @@ class CommonFeatureFusion(nn.Module):
         return common_feat
 
 class InteractionGraphProcessor(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, case_data=None):
         super().__init__()
         self.config = config
-        self.num_layers = 1 
-        self.hidden_dim = 256 
+        self.case_data = case_data
+        
+        self.debug_mode = True  
+        self.hidden_dim = 256
         self.dropout_rate = 0.2
+        
+        if self.debug_mode:
+            self.simple_gnn = dgl.nn.GraphConv(53, self.hidden_dim)  
+            self.activation = nn.ReLU()
+            self.dropout = nn.Dropout(self.dropout_rate)
 
-        self.gnn_layers = nn.ModuleList()
-        for i in range(self.num_layers):
-            in_feats = 53 if i == 0 else self.hidden_dim
-            self.gnn_layers.append(
-                GeometricGNNBase(
-                    in_feats=in_feats,
-                    out_feats=self.hidden_dim,
-                    gnn_type="egnn",
-                    edge_feat_size=20,
-                    dropout_rate=self.dropout_rate,
+        else:
+            self.num_layers = 1
+            
+            self.gnn_layers = nn.ModuleList()
+            for i in range(self.num_layers):
+                in_feats = 53 if i == 0 else self.hidden_dim
+                self.gnn_layers.append(
+                    GeometricGNNBase(
+                        in_feats=in_feats,
+                        out_feats=self.hidden_dim,
+                        gnn_type="egnn",
+                        edge_feat_size=20,
+                        dropout_rate=self.dropout_rate,
+                        case_data=case_data
+                    )
                 )
-            )
+            
         self.pool = dgl.nn.AvgPooling()
+
         self.fusion_module = CommonFeatureFusion(
             feat_dim=256,
             temperature=0.07,
+            print_interval=200,
             dropout_rate=self.dropout_rate
         )
 
@@ -195,19 +209,17 @@ class InteractionGraphProcessor(nn.Module):
             nn.Linear(256, 128),
             nn.LeakyReLU(0.1),
             nn.LayerNorm(128),
-            #nn.Dropout(0.2),  
             nn.Linear(128, 256)
         )
 
-        self.dropout = nn.Dropout(self.dropout_rate) 
-
+        self.dropout = nn.Dropout(self.dropout_rate)
+        
 
     def forward(self, interaction_graphs):
-        """Process a group of interaction diagrams (select the first conformation only)"""
 
         if not interaction_graphs:
             device = next(self.parameters()).device
-            return torch.zeros(1, 256, device=device), torch.tensor(0.0, device=device)
+            return torch.zeros(1, 256, device=device)
 
         graph = interaction_graphs[0]
         device = next(self.parameters()).device
@@ -217,33 +229,68 @@ class InteractionGraphProcessor(nn.Module):
             res_feat = graph.ndata['res_feat']
             atom_feat = graph.ndata['atom_feat']
             node_feat = torch.cat([res_feat, atom_feat], dim=1)
+            
+            if torch.isnan(node_feat).any() or torch.isinf(node_feat).any():
+                node_feat = torch.zeros_like(node_feat)
         else:
-            print("Warning: Insufficient node features. Use zero tensor as a substitute.")
             node_feat = torch.zeros(graph.num_nodes(), 53, device=device)
 
-        coords = graph.ndata['x']
-        edge_attr = graph.edata['unified_feat']
-            
-        for i, gnn_layer in enumerate(self.gnn_layers):
-            node_feat, updated_coords = gnn_layer(
-                graph,
-                node_feat,
-                coords=coords, 
-                edge_attr=edge_attr
-            )
+        if self.debug_mode:
 
-            coords = updated_coords
-            graph.ndata['x'] = coords
+            graph_with_self_loop = dgl.add_self_loop(graph)
 
-            if i < self.num_layers - 1:
-                node_feat = F.leaky_relu(node_feat, 0.1)
-                node_feat = self.dropout(node_feat)  
+            node_features = self.simple_gnn(graph_with_self_loop, node_feat)  
+            node_features = self.activation(node_features)    
+            node_features = self.dropout(node_features)   
 
-        graph_rep = self.pool(graph, node_feat)  # (1, 256)
-        conf_reps = graph_rep.unsqueeze(0)  # (1, 1, 256)
-        fused_rep, contrast_loss = self.fusion_module(conf_reps)
-        #fused_rep = self.dropout(fused_rep)
-        enhanced_rep = self.enhancer(fused_rep)
+            graph.ndata['h'] = node_features
+            graph_rep = dgl.mean_nodes(graph, 'h')
 
+            if torch.isnan(graph_rep).any() or torch.isinf(graph_rep).any():
+                graph_rep = torch.zeros(1, 256, device=device)
 
-        return fused_rep, contrast_loss
+            return graph_rep
+        else:
+            if 'x' in graph.ndata:
+                coords = graph.ndata['x']
+            else:
+                coords = torch.zeros(graph.num_nodes(), 3, device=device)
+                graph.ndata['x'] = coords
+
+            if 'unified_feat' in graph.edata:
+                edge_attr = graph.edata['unified_feat']
+                if edge_attr.size(1) != 20:
+                    num_edges = graph.num_edges()
+                    edge_attr = torch.zeros(num_edges, 20, device=device)
+            else:
+                num_edges = graph.num_edges()
+                edge_attr = torch.zeros(num_edges, 20, device=device)
+
+            for i, gnn_layer in enumerate(self.gnn_layers):
+                
+                node_feat, updated_coords = gnn_layer(
+                    graph,
+                    node_feat,
+                    coords=coords,
+                    edge_attr=edge_attr
+                )
+                
+                if torch.isnan(node_feat).any():
+                    return torch.zeros(1, 256, device=device)
+                
+                coords = updated_coords
+                graph.ndata['x'] = coords
+                
+                if i < self.num_layers - 1:
+                    node_feat = F.leaky_relu(node_feat, 0.1)
+                    node_feat = self.dropout(node_feat)
+
+            graph_rep = self.pool(graph, node_feat)
+
+            conf_reps = graph_rep.unsqueeze(0)
+            fused_rep, contrast_loss = self.fusion_module(conf_reps)
+
+            enhanced_rep = self.enhancer(fused_rep)
+
+            return fused_rep
+
