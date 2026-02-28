@@ -4,12 +4,7 @@ import sys, os
 from random import shuffle
 import torch
 import torch.nn as nn
-from models.gat import GATNet
-from models.gat_gcn import GAT_GCN
-from models.gcn import GCNNet
-from models.ginconv import GINConvNet
-from models.graphsage import GraphSAGENet
-from models.graphtransformer import TransformerConvNet
+from models.targetnpbind import GraphSAGENet
 from utils import *
 from sklearn.model_selection import KFold
 import torch.nn.functional as F
