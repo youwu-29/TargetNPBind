@@ -170,7 +170,7 @@ class InteractionGraphProcessor(nn.Module):
         self.config = config
         self.case_data = case_data
         
-        self.debug_mode = True  
+        self.debug_mode = False
         self.hidden_dim = 256
         self.dropout_rate = 0.2
         
@@ -178,10 +178,8 @@ class InteractionGraphProcessor(nn.Module):
             self.simple_gnn = dgl.nn.GraphConv(53, self.hidden_dim)  
             self.activation = nn.ReLU()
             self.dropout = nn.Dropout(self.dropout_rate)
-
         else:
             self.num_layers = 1
-            
             self.gnn_layers = nn.ModuleList()
             for i in range(self.num_layers):
                 in_feats = 53 if i == 0 else self.hidden_dim
@@ -196,27 +194,35 @@ class InteractionGraphProcessor(nn.Module):
                     )
                 )
             
-        self.pool = dgl.nn.AvgPooling()
+            self.pool = dgl.nn.AvgPooling()
+            
+            self.fusion_strategy = "common"
+            if self.fusion_strategy == "common":
+                self.fusion_module = CommonFeatureFusion(
+                    feat_dim=256,
+                    temperature=0.07,
+                    print_interval=200,
+                    dropout_rate=self.dropout_rate
+                )
 
-        self.fusion_module = CommonFeatureFusion(
-            feat_dim=256,
-            temperature=0.07,
-            print_interval=200,
-            dropout_rate=self.dropout_rate
-        )
-
-        self.enhancer = nn.Sequential(
-            nn.Linear(256, 128),
-            nn.LeakyReLU(0.1),
-            nn.LayerNorm(128),
-            nn.Linear(128, 256)
-        )
+            self.enhancer = nn.Sequential(
+                nn.Linear(256, 128),
+                nn.LeakyReLU(0.1),
+                nn.LayerNorm(128),
+                nn.Linear(128, 256)
+            )
 
         self.dropout = nn.Dropout(self.dropout_rate)
         
+        if self.debug_mode:
+            self.fusion_module = type('DummyFusionModule', (), {
+                'batch_common_feats': None,
+                'print_interval': 200,
+                'step_counter': 0
+            })()
 
     def forward(self, interaction_graphs):
-
+        
         if not interaction_graphs:
             device = next(self.parameters()).device
             return torch.zeros(1, 256, device=device)
@@ -240,8 +246,8 @@ class InteractionGraphProcessor(nn.Module):
             graph_with_self_loop = dgl.add_self_loop(graph)
 
             node_features = self.simple_gnn(graph_with_self_loop, node_feat)  
-            node_features = self.activation(node_features)    
-            node_features = self.dropout(node_features)   
+            node_features = self.activation(node_features)     
+            node_features = self.dropout(node_features)       
 
             graph.ndata['h'] = node_features
             graph_rep = dgl.mean_nodes(graph, 'h')
@@ -250,6 +256,7 @@ class InteractionGraphProcessor(nn.Module):
                 graph_rep = torch.zeros(1, 256, device=device)
 
             return graph_rep
+            
         else:
             if 'x' in graph.ndata:
                 coords = graph.ndata['x']
@@ -291,6 +298,6 @@ class InteractionGraphProcessor(nn.Module):
             fused_rep, contrast_loss = self.fusion_module(conf_reps)
 
             enhanced_rep = self.enhancer(fused_rep)
-
             return fused_rep
+
 
