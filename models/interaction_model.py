@@ -9,89 +9,103 @@ import numpy as np
 
 
 class EGNNConv(nn.Module):
-    def __init__(self, in_size, hidden_size, out_size, edge_feat_size=0, dropout_rate=0.2):
+    def __init__(self, in_size, hidden_size, out_size, edge_feat_size=0, dropout_rate=0.2, case_data=None):
         super().__init__()
         self.edge_feat_size = edge_feat_size
         self.dropout_rate = dropout_rate
+        self.case_data = case_data
 
-        self.phi_e = nn.Sequential(
-            nn.Linear(in_size * 2 + 1 + edge_feat_size, hidden_size),
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(in_size * 2 + edge_feat_size + 1, hidden_size),  
             nn.SiLU(),
-            nn.LayerNorm(hidden_size),
             nn.Linear(hidden_size, hidden_size),
             nn.SiLU(),
             nn.Linear(hidden_size, hidden_size)
         )
-        self.phi_x = nn.Sequential(
+        
+        self.coord_mlp = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.SiLU(),
             nn.Linear(hidden_size, 1)
         )
-
-        self.phi_h = nn.Sequential(
+        
+        self.node_mlp = nn.Sequential(
             nn.Linear(in_size + hidden_size, hidden_size),
             nn.SiLU(),
-            nn.LayerNorm(hidden_size),
             nn.Linear(hidden_size, out_size)
         )
-
+        
     def forward(self, feat, coords, edge_index, edge_attr=None):
         row, col = edge_index
-        num_nodes = feat.size(0) 
-        dtype = feat.dtype
-        coords = coords.to(dtype)
+        num_nodes = feat.size(0)
+        
         rel_coords = coords[row] - coords[col]
-        dist_sq = torch.sum(rel_coords ** 2, dim=1, keepdim=True).to(dtype)
-
-        msg_input = [feat[row], feat[col], dist_sq]
+        squared_distance = torch.sum(rel_coords ** 2, dim=1, keepdim=True)
+        
+        message_inputs = [feat[row], feat[col], squared_distance]
+        
         if self.edge_feat_size > 0 and edge_attr is not None:
             if edge_attr.dim() == 1:
                 edge_attr = edge_attr.unsqueeze(-1)
-            edge_attr = edge_attr.to(dtype)
-            msg_input.append(edge_attr)
-
-        msg_input = torch.cat(msg_input, dim=1)
-        messages = self.phi_e(msg_input)
-        coord_weights = self.phi_x(messages)
-
-        coord_update = rel_coords * coord_weights
-        coord_agg = torch.zeros_like(coords, dtype=dtype)
-        coord_agg.index_add_(0, row, coord_update.to(dtype))
-        deg = torch.zeros(coords.size(0), device=coords.device, dtype=torch.float32)
+            message_inputs.append(edge_attr)
+        
+        message_input = torch.cat(message_inputs, dim=-1)
+        
+        messages = self.edge_mlp(message_input)
+        
+        coord_weights = self.coord_mlp(messages)
+        
+        coord_updates = rel_coords * coord_weights
+        
+        coord_agg = torch.zeros_like(coords)
+        coord_agg.index_add_(0, row, coord_updates)
+        
+        deg = torch.zeros(coords.size(0), device=coords.device)
         deg.index_add_(0, row, torch.ones_like(row, dtype=torch.float32))
-        deg = deg.clamp(min=1).unsqueeze(-1)  
-        deg = deg.to(dtype)  
-
+        deg = deg.clamp(min=1).unsqueeze(-1)
+        
         new_coords = coords + coord_agg / deg
-        agg_msgs = torch.zeros(num_nodes, messages.size(1), dtype=dtype, device=feat.device)
-        agg_msgs.index_add_(0, row, messages)
-
-        node_input = torch.cat([feat, agg_msgs], dim=1)
-        new_feat = self.phi_h(node_input)
+        
+        agg_messages = torch.zeros(num_nodes, messages.size(-1), device=feat.device)
+        agg_messages.index_add_(0, row, messages)
+        
+        node_input = torch.cat([feat, agg_messages], dim=-1)
+        new_feat = self.node_mlp(node_input)
+        
+        if not self.training and self.case_data is not None:
+            messages_detached = messages.detach().cpu()
+            edge_types_detached = edge_attr[:, 0].detach().cpu() if edge_attr is not None else torch.zeros_like(row)
+            atom_coords_detached = new_coords.detach().cpu()
             
+            self.case_data['case2']['edge_messages'].append(messages_detached)
+            self.case_data['case2']['edge_types'].append(edge_types_detached)
+            self.case_data['case2']['atom_coords'].append(atom_coords_detached)
+        
         return new_feat, new_coords
 
+
 class GeometricGNNBase(nn.Module):
-    def __init__(self, in_feats, out_feats, gnn_type="egnn", edge_feat_size=0, dropout_rate=0.2):
+    def __init__(self, in_feats, out_feats, gnn_type="egnn", edge_feat_size=0, dropout_rate=0.2, case_data=None):
         super().__init__()
         self.gnn_type = gnn_type
         self.edge_feat_size = edge_feat_size
         self.dropout_rate = dropout_rate
+        self.case_data = case_data
 
-        if gnn_type == "egnn":
-            self.gnn = EGNNConv(in_size=in_feats,
-                                hidden_size=256,
-                                out_size=out_feats,
-                                edge_feat_size=edge_feat_size,
-                                dropout_rate=dropout_rate,
-                                )
+        self.gnn = EGNNConv(
+            in_size=in_feats,
+            hidden_size=256,
+            out_size=out_feats,
+            edge_feat_size=edge_feat_size,
+            dropout_rate=dropout_rate,
+            case_data=case_data
+        )
 
         self.res_gate = nn.Sequential(
             nn.Linear(out_feats, 1),
             nn.Sigmoid()
         )
         self.output_norm = nn.LayerNorm(out_feats)
-
         self.feat_projector = nn.Linear(in_feats, out_feats)
         self.feat_dropout = nn.Dropout(dropout_rate)
 
@@ -102,22 +116,17 @@ class GeometricGNNBase(nn.Module):
             else:
                 coords = torch.zeros(feat.size(0), 3, device=feat.device)
 
-        edge_index = graph.edges()
-        if self.gnn_type in ["egnn"]:
-            if self.gnn_type == "egnn":
-                edge_index = torch.stack(graph.edges(), dim=0)
-                new_feat, new_coords = self.gnn(feat, coords, edge_index, edge_attr)
+        edge_index = torch.stack(graph.edges(), dim=0)
 
-                graph.ndata['x'] = new_coords
-            else:
-                new_feat = self.gnn(feat, coords, edge_index, edge_attr=edge_attr)
-                new_coords = coords 
+        new_feat, new_coords = self.gnn(feat, coords, edge_index, edge_attr)
+
+        graph.ndata['x'] = new_coords
 
         projected_feat = self.feat_projector(feat)
         gate = self.res_gate(new_feat)
         output = F.leaky_relu(gate * new_feat + (1 - gate) * projected_feat, 0.2)
         output = self.output_norm(output)
-        output =  self.feat_dropout(output)
+        output = self.feat_dropout(output)
         
         return output, new_coords
 
@@ -235,5 +244,6 @@ class InteractionGraphProcessor(nn.Module):
         fused_rep, contrast_loss = self.fusion_module(conf_reps)
         #fused_rep = self.dropout(fused_rep)
         enhanced_rep = self.enhancer(fused_rep)
+
 
         return fused_rep, contrast_loss
