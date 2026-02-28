@@ -4,7 +4,7 @@ import sys, os
 from random import shuffle
 import torch
 import torch.nn as nn
-from models.targetnpbind import GraphSAGENet
+from models.targetnpbind import TargetNPBind
 from utils import *
 from sklearn.model_selection import KFold
 import torch.nn.functional as F
